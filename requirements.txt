@@ -1,0 +1,9 @@
+torch
+torchvision
+clip-anytorch
+pyarrow
+pillow
+tf-yarn
+wandb
+webdataset==0.1.103
+tqdm
