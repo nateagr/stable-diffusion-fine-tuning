@@ -223,7 +223,7 @@ def load_model(precision: Precision, device: str, **sd_kwargs):
         sd_kwargs["revision"] = "fp16"
     dtype = torch.float16 if precision == Precision.FP16 else torch.float32
     pipe = StableDiffusionPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4",
+        "CompVis/stable-diffusion-v-1-4",
         torch_dtype=dtype,
         use_auth_token=True,
         **sd_kwargs
