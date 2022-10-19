@@ -7,3 +7,5 @@ tqdm
 diffusers
 transformers
 torch-ema
+tf-yarn
+fsspec

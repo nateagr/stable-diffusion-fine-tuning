@@ -41,3 +41,19 @@ class PokemonDataset(torch.utils.data.Dataset):
         img = self.dataset[idx]["image"]
         text = self.dataset[idx]["text"]
         return (text, img_transform(img))
+
+
+class WrapperDataset(torch.utils.data.IterableDataset):
+    def __init__(self, inner_dataset, size, num_splits):
+        super().__init__()
+        self.inner_dataset = inner_dataset
+        self.size = size // num_splits
+    
+    def __len__(self):
+        return self.size
+    
+    def __iter__(self):
+        item = iter(self.inner_dataset)
+        img = item["image"]
+        text = item["text"]
+        return (text, img_transform(img))

@@ -7,6 +7,7 @@ import shutil
 from typing import NamedTuple
 from enum import Enum
 from getpass import getuser
+from typing import Union
 
 import pandas as pd
 import torch
@@ -15,8 +16,15 @@ from transformers import get_scheduler
 from transformers import set_seed
 from torch_ema import ExponentialMovingAverage
 from tqdm import tqdm
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from stable_diffusion_fine_tuning.dataset import PandasDataset
+
+
+class Precision(Enum):
+    FP32 = 1
+    FP16 = 2
+    AMP = 3
 
 
 class AdamConfig(NamedTuple):
@@ -39,92 +47,78 @@ class GradientConfig(NamedTuple):
     enable_grad = lambda _, x: "norm" in x or "bias" in x or "emb" in x or "attn" in x
 
 
-class Precision(Enum):
-    FP32 = 1
-    FP16 = 2
-    AMP = 3
+class ExperimentConfig(NamedTuple):
+    adam_config: AdamConfig = AdamConfig()
+    dataset_config: DatasetConfig = DatasetConfig()
+    gradient_config: GradientConfig = GradientConfig()
+    seed: int = 23906
+    device: str = "cuda:0"
+    train_steps: int = 600
+    warmup: int = 48
+    nb_timesteps = 1000
+    ema_decay = 0.0
+    scheduler_type = "linear"
+    precision: Precision = Precision.FP32
 
 
 def run(
-    adam_config: AdamConfig = AdamConfig(),
-    dataset_config: DatasetConfig = DatasetConfig(),
-    gradient_config: GradientConfig = GradientConfig(),
-    seed: int = 23906,
-    device: str = "cuda:0",
-    train_steps: int = 600,
-    warmup: int = 48,
-    nb_timesteps = 1000,
-    ema_decay = 0.0,
-    scheduler_type = "linear",
-    precision: Precision = Precision.FP32
+    pipeline = None,
+    config: ExperimentConfig = ExperimentConfig()
 ):
-    dataset_df = pd.read_pickle(dataset_config.path)
+    dataset_df = pd.read_pickle(config.dataset_config.path)
     dataset = PandasDataset(dataset_df)
-    training_ds_size = int(len(dataset) * dataset_config.training_ds_ratio)
+    training_ds_size = int(len(dataset) * config.dataset_config.training_ds_ratio)
     train_ds, test_ds = torch.utils.data.random_split(dataset, [training_ds_size, len(dataset) - training_ds_size])
-    train_dataloader = torch.utils.data.DataLoader(train_ds, batch_size=dataset_config.train_batch_size, shuffle=True, num_workers=0)
-    test_dataloader = torch.utils.data.DataLoader(test_ds, batch_size=dataset_config.test_batch_size, shuffle=True, num_workers=0)
+    train_dataloader = torch.utils.data.DataLoader(train_ds, batch_size=config.dataset_config.train_batch_size, shuffle=True, num_workers=0)
+    test_dataloader = torch.utils.data.DataLoader(test_ds, batch_size=config.dataset_config.test_batch_size, shuffle=True, num_workers=0)
 
     return run_with_datasets(
+        pipeline=pipeline,
         train_dataloader=train_dataloader,
         test_dataloader=test_dataloader,
-        adam_config=adam_config,
-        dataset_config=dataset_config,
-        gradient_config=gradient_config,
-        seed=seed,
-        device=device,
-        train_steps=train_steps,
-        warmup=warmup,
-        nb_timesteps=nb_timesteps,
-        ema_decay=ema_decay,
-        scheduler_type=scheduler_type,
-        precision=precision
+        experiment_config=config
     )
 
 
 def run_with_datasets(
+    pipeline,
     train_dataloader,
     test_dataloader,
-    adam_config: AdamConfig = AdamConfig(),
-    gradient_config: GradientConfig = GradientConfig(),
-    seed: int = 23906,
-    device: str = "cuda:0",
-    train_steps: int = 600,
-    warmup: int = 48,
-    nb_timesteps = 1000,
-    ema_decay = 0.0,
-    scheduler_type = "linear",
-    precision: Precision = Precision.FP32,
+    config: ExperimentConfig = ExperimentConfig(),
     test_nb_samples: int = 1,
     nb_steps_between_validation: int = 200,
     test_root_dir: str = f"/home/{getuser()}/stable-diffusion-tests",
     nb_steps_between_ckpt: int = 200,
     ckpt_root_dir: str = f"/home/{getuser()}/stable-diffusion-checkpoints",
 ):
-    if seed == 0:
+    if config.seed == 0:
         seed = random.getrandbits(16)
     print("Using seed:", seed)
     set_seed(seed)
 
-    pipe = load_model(precision, device)
-    pipe.guidance_scale = 1.0
-    pipe.scheduler.set_timesteps(nb_timesteps)
+    if not pipeline:
+        pipeline = load_model(config.precision, config.device)
+    unwrap_pipeline = _unwrap_model(pipeline)
+    unwrap_pipeline.guidance_scale = 1.0
+    unwrap_pipeline.scheduler.set_timesteps(config.nb_timesteps)
 
-    params_to_optimize =configure_gradient(pipe, gradient_config.gradient_checkpointing, gradient_config.enable_grad)
+    params_to_optimize =configure_gradient(
+        unwrap_pipeline, config.gradient_config.gradient_checkpointing, config.gradient_config.enable_grad
+    )
 
     optimizer = torch.optim.AdamW(
-        params_to_optimize, lr=adam_config.lr, weight_decay=adam_config.weight_decay,
-        betas=adam_config.betas, eps=adam_config.eps
+        params_to_optimize, lr=config.adam_config.lr, weight_decay=config.adam_config.weight_decay,
+        betas=config.adam_config.betas, eps=config.adam_config.eps
     )
     
-    ema = configureExponentialMovingAverage(ema_decay, params_to_optimize)
+    ema = configureExponentialMovingAverage(config.ema_decay, params_to_optimize)
 
     scheduler = get_scheduler(
-        scheduler_type, optimizer, warmup, train_steps // gradient_config.grad_acc
+        config.scheduler_type, optimizer, config.warmup, config.train_steps // config.gradient_config.grad_acc
     )
 
     return train(
-        pipe=pipe,
+        pipe=pipeline,
         optimizer=optimizer,
         scheduler=scheduler,
         ema=ema,
@@ -132,11 +126,11 @@ def run_with_datasets(
         test_dataloader=test_dataloader,
         test_nb_samples=test_nb_samples,
         test_root_dir=test_root_dir,
-        train_steps=train_steps,
+        train_steps=config.train_steps,
         params_to_optimize=params_to_optimize,
-        grad_acc=gradient_config.grad_acc,
-        precision=precision,
-        device=device,
+        grad_acc=config.gradient_config.grad_acc,
+        precision=config.precision,
+        device=config.device,
         ckpt_root_dir=ckpt_root_dir,
         nb_steps_between_ckpt=nb_steps_between_ckpt,
         nb_steps_between_validation=nb_steps_between_validation
@@ -166,18 +160,19 @@ def train(
     bar = tqdm(initial=global_i, total=train_steps)
     scaler = torch.cuda.amp.GradScaler()
     dtype = torch.FloatTensor if precision in [Precision.FP32, Precision.AMP] else torch.HalfTensor
+    unwrap_pipeline = _unwrap_model(pipe)
 
     while True:
         total_loss = 0.0
         for i, (text, image) in enumerate(train_dataloader):
-            pipe.unet.train()
+            unwrap_pipeline.unet.train()
             torch.cuda.empty_cache()
             
             if precision == Precision.AMP:
                 with torch.cuda.amp.autocast():
-                    loss = get_loss(text=text, image=image, pipe=pipe, device=device, dtype=dtype)
+                    loss = get_loss(text=text, image=image, pipe=unwrap_pipeline, device=device, dtype=dtype)
             else:
-                loss = get_loss(text=text, image=image, pipe=pipe, device=device, dtype=dtype)
+                loss = get_loss(text=text, image=image, pipe=unwrap_pipeline, device=device, dtype=dtype)
             losses.append(loss.item())
             total_loss += loss.item()
             bar.set_postfix(loss=total_loss / (i + 1))
@@ -200,11 +195,11 @@ def train(
                 optimizer.zero_grad()
 
                 if global_i % nb_steps_between_ckpt == nb_steps_between_ckpt - 1:
-                    save_checkpoint(pipe=pipe, optimizer=optimizer, ckpt_root_dir=ckpt_root_dir, global_i=global_i)
+                    save_checkpoint(pipe=unwrap_pipeline, optimizer=optimizer, ckpt_root_dir=ckpt_root_dir, global_i=global_i)
 
-                if global_i % nb_steps_between_validation == nb_steps_between_validation - 1:
+                if global_i % nb_steps_between_validation == nb_steps_between_validation - 1 and test_dataloader:
                     validate(
-                        pipe=pipe, ema=ema, root_dir=test_root_dir, global_i=global_i,
+                        pipe=unwrap_pipeline, ema=ema, root_dir=test_root_dir, global_i=global_i,
                         nb_samples=test_nb_samples, dataloader=test_dataloader)
                 
                 global_i += 1
@@ -215,7 +210,7 @@ def train(
         if global_i >= train_steps:
             break
 
-    return pipe
+    return unwrap_pipeline
 
 
 def load_model(precision: Precision, device: str, **sd_kwargs):
@@ -306,3 +301,7 @@ def validate(pipe, ema, root_dir: str, global_i: int, nb_samples, dataloader):
                 fd.write(text[0].encode())
             generated = pipe(text[0])["sample"][0]
             generated.save(os.path.join(validation_dir, f"sample_{i}_image.jpg"))
+
+
+def _unwrap_model(model: Union[DDP, torch.nn.Module]) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
