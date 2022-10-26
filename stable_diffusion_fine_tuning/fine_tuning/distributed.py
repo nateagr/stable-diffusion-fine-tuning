@@ -12,8 +12,8 @@ from tf_yarn.pytorch import (
 import torch.distributed as dist
 
 from stable_diffusion_fine_tuning.model import load_stable_diffusion_pipeline
-from stable_diffusion_fine_tuning.dataset import WrapperDataset
-from stable_diffusion_fine_tuning.main import run_with_datasets
+from stable_diffusion_fine_tuning.fine_tuning.dataset import WrapperDataset
+from stable_diffusion_fine_tuning.fine_tuning.main import run_with_datasets
 
 
 def run_distributed(
