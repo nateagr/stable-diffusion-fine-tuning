@@ -1,19 +1,23 @@
+import os
 import io
 import random
 from argparse import Namespace
 from enum import Enum
-from typing import List, NamedTuple, Tuple
+from typing import List, Tuple
+from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 
+from dataclasses_json import DataClassJsonMixin, dataclass_json, LetterCase
 from PIL import Image
 import numpy as np
 import pandas as pd
 import torch
 from torchvision import transforms
 from diffusers import StableDiffusionInpaintPipeline
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint import prepare_mask_and_masked_image
 from transformers import get_scheduler
 from torch_ema import ExponentialMovingAverage
 from tqdm import tqdm
+import fsspec
 
 
 AUTH_TOKEN = "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"
@@ -25,7 +29,9 @@ class Precision(Enum):
     AMP = 3
 
 
-class FineTuningConfig(NamedTuple):
+@dataclass_json(letter_case=LetterCase.CAMEL)
+@dataclass
+class FineTuningConfig(DataClassJsonMixin):
     enable_grad_vae: bool
     enable_grad_text_encoder: bool
     n_epochs: int
@@ -37,16 +43,109 @@ class FineTuningConfig(NamedTuple):
     eps: float
     weight_decay: float
     ema_decay: float
+    hdfs_root_dir: str
 
 
-def load_pipeline(model_id: str, device: str) -> torch.nn.Module:
+def save_checkpoint(pipe, hdfs_root_dir: str, steps: int):
+    with TemporaryDirectory() as tmp:
+        local_path = os.path.join(tmp, f"checkpoint-{steps}")
+        pipe.save_pretrained(local_path)
+        hdfs_path = os.path.join(hdfs_root_dir, os.path.basename(local_path))
+        fs, _ = fsspec.core.url_to_fs(hdfs_path, use_listings_cache=False)
+        if not fs.exists(hdfs_root_dir):
+            fs.mkdir(hdfs_root_dir)
+        fs.put(local_path, hdfs_path, recursive=True)
+
+
+def load_pipeline(hdfs_path: str, device: str) -> torch.nn.Module:
     """Load stable diffusion pipeline"""
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        model_id,
-        # revision="fp16", torch_dtype=torch.float16,
-        use_auth_token=AUTH_TOKEN  # pylint: disable=no-member
-    ).to(device)
-    return pipe
+    with TemporaryDirectory() as tmp:
+        local_path = os.path.join(tmp, os.path.basename(hdfs_path))
+        fs, _ = fsspec.core.url_to_fs(hdfs_path, use_listings_cache=False)
+        fs.get(hdfs_path, local_path, recursive=True)
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            local_path,
+            # revision="fp16", torch_dtype=torch.float16,
+            use_auth_token=AUTH_TOKEN  # pylint: disable=no-member
+        ).to(device)
+        return pipe
+
+
+def prepare_mask_and_masked_image(image, mask):
+    if isinstance(image, torch.Tensor):
+        if not isinstance(mask, torch.Tensor):
+            raise TypeError(f"`image` is a torch.Tensor but `mask` (type: {type(mask)} is not")
+
+        # Batch single image
+        if image.ndim == 3:
+            assert image.shape[0] == 3, "Image outside a batch should be of shape (3, H, W)"
+            image = image.unsqueeze(0)
+
+        # Batch and add channel dim for single mask
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+
+        # Batch single mask or add channel dim
+        if mask.ndim == 3:
+            # Single batched mask, no channel dim or single mask not batched but channel dim
+            if mask.shape[0] == 1:
+                mask = mask.unsqueeze(0)
+
+            # Batched masks no channel dim
+            else:
+                mask = mask.unsqueeze(1)
+
+        assert image.ndim == 4 and mask.ndim == 4, "Image and Mask must have 4 dimensions"
+        assert image.shape[-2:] == mask.shape[-2:], "Image and Mask must have the same spatial dimensions"
+        assert image.shape[0] == mask.shape[0], "Image and Mask must have the same batch size"
+
+        # Check image is in [-1, 1]
+        if image.min() < -1 or image.max() > 1:
+            raise ValueError("Image should be in [-1, 1] range")
+
+        # Check mask is in [0, 1]
+        if mask.min() < 0 or mask.max() > 1:
+            raise ValueError("Mask should be in [0, 1] range")
+
+        # Binarize mask
+        mask[mask < 0.5] = 0
+        mask[mask >= 0.5] = 1
+
+        # Image as float32
+        image = image.to(dtype=torch.float32)
+    elif isinstance(mask, torch.Tensor):
+        raise TypeError(f"`mask` is a torch.Tensor but `image` (type: {type(image)} is not")
+    else:
+        # preprocess image
+        if isinstance(image, (Image.Image, np.ndarray)):
+            image = [image]
+
+        if isinstance(image, list) and isinstance(image[0], Image.Image):
+            image = [np.array(i.convert("RGB"))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+        elif isinstance(image, list) and isinstance(image[0], np.ndarray):
+            image = np.concatenate([i[None, :] for i in image], axis=0)
+
+        image = image.transpose(0, 3, 1, 2)
+        image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+
+        # preprocess mask
+        if isinstance(mask, (Image.Image, np.ndarray)):
+            mask = [mask]
+
+        if isinstance(mask, list) and isinstance(mask[0], Image.Image):
+            mask = np.concatenate([np.array(m.convert("L"))[None, None, :] for m in mask], axis=0)
+            mask = mask.astype(np.float32) / 255.0
+        elif isinstance(mask, list) and isinstance(mask[0], np.ndarray):
+            mask = np.concatenate([m[None, None, :] for m in mask], axis=0)
+
+        mask[mask < 0.5] = 0
+        mask[mask >= 0.5] = 1
+        mask = torch.from_numpy(mask)
+
+    masked_image = image * (mask < 0.5)
+
+    return mask, masked_image
 
 
 def decode_mask(encoded_mask: List[int], image_width: int, image_height: int) -> np.ndarray:
@@ -157,12 +256,6 @@ def create_exponentiel_moving_average_model(ema_decay, model):
             update=lambda: None
         )
     return ema_model
-
-
-def save_checkpoint(pipe, suffix):
-    #if ema_decay:
-    #    ema_unet.copy_to(unet.parameters())
-    pipe.save_pretrained(f"/home/g.racic/sync/fine_tuned_sd_inpaint/{suffix}")
     
     
 def compute_loss(batch, pipe, device, dtype, resolution, vae_scale_factor):
@@ -220,10 +313,18 @@ def compute_loss(batch, pipe, device, dtype, resolution, vae_scale_factor):
 
 
 def run(config: FineTuningConfig):
-    model_id = "runwayml/stable-diffusion-inpainting"
-    device = "cuda:0"
+    fs, _ = fsspec.core.url_to_fs(config.hdfs_root_dir, use_listings_cache=False)
+    if not fs.exists(config.hdfs_root_dir):
+        fs.mkdir(config.hdfs_root_dir)
+    with fs.open(os.path.join(config.hdfs_root_dir, "config"), "w") as fd:
+        fd.write(config.to_json())
 
-    pipe = load_pipeline(model_id, device)
+
+    device = "cuda:0"
+    pipe = load_pipeline(
+        "hdfs://root/user/g.racic/pretrained_runwayml_stable_diffusion_inpainting",
+        device
+    )
 
     # Dataset
     vae_scale_factor = 2 ** (len(pipe.vae.config.block_out_channels) - 1)
@@ -329,7 +430,7 @@ def run(config: FineTuningConfig):
                 optimizer.zero_grad()
 
                 if global_i % nb_steps_between_ckpt == nb_steps_between_ckpt - 1:
-                    save_checkpoint(pipe, global_i)
+                    save_checkpoint(pipe, config.hdfs_root_dir, global_i)
 
                 global_i += 1
 
